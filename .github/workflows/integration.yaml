@@ -23,20 +23,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0 # zizmor: ignore[cache-poisoning] caching is intentional for CI jobs
         with:
           go-version-file: go.mod
 
       - name: Run go mod tidy
         run: |
           go mod tidy
+          go -C test/e2e mod tidy
           if ! git diff --quiet; then
-            echo "Please run 'go mod tidy' and commit the changes."
+            echo "Please run 'go mod tidy' in the root and test/e2e modules and commit the changes."
             git diff
             false
           fi
@@ -80,12 +82,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0 # zizmor: ignore[cache-poisoning] caching is intentional for CI jobs
         with:
           go-version-file: go.mod
 
@@ -102,12 +105,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0 # zizmor: ignore[cache-poisoning] caching is intentional for CI jobs
         with:
           go-version-file: go.mod
 
@@ -125,26 +129,27 @@ jobs:
         run: |
           BRANCH=""
           if [ "${{ github.event_name }}" == "push" ]; then
-            BRANCH=${{ github.ref_name }}
+            BRANCH=${GITHUB_REF_NAME}
           elif [ "${{ github.event_name }}" == "pull_request" ]; then
-            BRANCH=${{ github.base_ref }}
+            BRANCH=${GITHUB_BASE_REF}
           fi
           echo "Branch name: $BRANCH"
           echo "BRANCH=$BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Checkout source code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Get Helm version
         id: get_helm_version
         run: |
-          HELM_VERSION=$(grep -e '^	helm.sh/helm/v3 v' go.mod | cut -d ' ' -f 2)
+          HELM_VERSION=$(grep -e '^[[:space:]]*helm.sh/helm/v3 v' test/e2e/go.mod | cut -d ' ' -f 2)
           echo "HELM_VERSION=$HELM_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Install Helm
-        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
         with:
           version: ${{ steps.get_helm_version.outputs.HELM_VERSION }}
 
@@ -195,8 +200,8 @@ jobs:
         if: steps.list-changed.outputs.changed == 'true'
         uses: manusa/actions-setup-minikube@b589f2d61bf96695c546929c72b38563e856059d # v2.14.0
         with:
-          minikube version: v1.33.0
-          kubernetes version: v1.30.0
+          minikube version: v1.38.1
+          kubernetes version: v1.35.0
           start args: --memory 6g --cpus=2 --addons ingress
           github token: ${{ inputs.github-token }}
 
@@ -205,7 +210,9 @@ jobs:
         run: |
           docker build -t ghcr.io/kubeflow/spark-operator/controller:local .
           minikube image load ghcr.io/kubeflow/spark-operator/controller:local
-          ct install --target-branch ${{ steps.get_branch.outputs.BRANCH }}
+          ct install --target-branch ${STEPS_GET_BRANCH_OUTPUTS_BRANCH}
+        env:
+          STEPS_GET_BRANCH_OUTPUTS_BRANCH: ${{ steps.get_branch.outputs.BRANCH }}
 
   e2e-test:
     runs-on: ubuntu-latest
@@ -222,14 +229,18 @@ jobs:
     name: e2e-test (${{ matrix.k8s_version }}, ${{ matrix.deploy_method }})
     steps:
       - name: Checkout source code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0 # zizmor: ignore[cache-poisoning] caching is intentional for CI jobs
         with:
           go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            test/e2e/go.sum
 
       - name: Create a Kind cluster
         run: make kind-create-cluster KIND_K8S_VERSION=${{ matrix.k8s_version }}

@@ -18,7 +18,6 @@ package webhook
 
 import (
 	"context"
-	"crypto/tls"
 	"flag"
 	"os"
 	"slices"
@@ -45,6 +44,8 @@ import (
 	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	operatortls "github.com/kubeflow/spark-operator/v2/pkg/tls"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1alpha1"
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
@@ -107,7 +108,8 @@ var (
 
 	healthProbeBindAddress string
 	secureMetrics          bool
-	enableHTTP2            bool
+	tlsMinVersion          string
+	tlsCipherSuites        []string
 	development            bool
 	zapOptions             = logzap.Options{}
 )
@@ -157,8 +159,8 @@ func NewStartCommand() *cobra.Command {
 	command.Flags().StringVar(&leaderElectionLockName, "leader-election-lock-name", "spark-operator-lock", "Name of the ConfigMap for leader election.")
 	command.Flags().StringVar(&leaderElectionLockNamespace, "leader-election-lock-namespace", "spark-operator", "Namespace in which to create the ConfigMap for leader election.")
 	command.Flags().DurationVar(&leaderElectionLeaseDuration, "leader-election-lease-duration", 15*time.Second, "Leader election lease duration.")
-	command.Flags().DurationVar(&leaderElectionRenewDeadline, "leader-election-renew-deadline", 14*time.Second, "Leader election renew deadline.")
-	command.Flags().DurationVar(&leaderElectionRetryPeriod, "leader-election-retry-period", 4*time.Second, "Leader election retry period.")
+	command.Flags().DurationVar(&leaderElectionRenewDeadline, "leader-election-renew-deadline", 10*time.Second, "Leader election renew deadline.")
+	command.Flags().DurationVar(&leaderElectionRetryPeriod, "leader-election-retry-period", 2*time.Second, "Leader election retry period.")
 
 	// Prometheus metrics
 	command.Flags().BoolVar(&enableMetrics, "enable-metrics", false, "Enable metrics.")
@@ -170,7 +172,13 @@ func NewStartCommand() *cobra.Command {
 
 	command.Flags().StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	command.Flags().BoolVar(&secureMetrics, "secure-metrics", false, "If set the metrics endpoint is served securely")
-	command.Flags().BoolVar(&enableHTTP2, "enable-http2", false, "If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	command.Flags().StringVar(&tlsMinVersion, "webhook-tls-min-version", "VersionTLS12",
+		"Minimum TLS version for the webhook and metrics servers. "+
+			"Possible values: VersionTLS12, VersionTLS13")
+	command.Flags().StringSliceVar(&tlsCipherSuites, "webhook-tls-cipher-suites", []string{},
+		"Comma-separated list of cipher suites for the webhook and metrics servers. "+
+			"If omitted, the default Go cipher suites are used. "+
+			"Applies to TLS 1.2 only; TLS 1.3 cipher suites are not configurable in Go. Possible values listed at https://pkg.go.dev/crypto/tls#CipherSuites")
 
 	flagSet := flag.NewFlagSet("controller", flag.ExitOnError)
 	ctrl.RegisterFlags(flagSet)
@@ -194,10 +202,15 @@ func start() {
 	cfg.Burst = kubeAPIBurst
 
 	// Create the manager.
-	tlsOptions := newTLSOptions()
+	tlsOptions, err := operatortls.SetupTLS(tlsMinVersion, tlsCipherSuites)
+	if err != nil {
+		logger.Error(err, "Failed to set up TLS")
+		os.Exit(1)
+	}
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: operatorscheme.WebhookScheme,
 		Cache:  newCacheOptions(),
+		Client: client.Options{},
 		Metrics: metricsserver.Options{
 			BindAddress:   metricsBindAddress,
 			SecureServing: secureMetrics,
@@ -214,6 +227,9 @@ func start() {
 		LeaderElection:          enableLeaderElection,
 		LeaderElectionID:        leaderElectionLockName,
 		LeaderElectionNamespace: leaderElectionLockNamespace,
+		LeaseDuration:           &leaderElectionLeaseDuration,
+		RenewDeadline:           &leaderElectionRenewDeadline,
+		RetryPeriod:             &leaderElectionRetryPeriod,
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
 		// when the Manager ends. This requires the binary to immediately end when the
 		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
@@ -291,8 +307,7 @@ func start() {
 		}
 	}
 
-	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&v1alpha1.SparkConnect{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &v1alpha1.SparkConnect{}).
 		WithDefaulter(webhook.NewSparkConnectDefaulter()).
 		WithValidator(webhook.NewSparkConnectValidator()).
 		WithLogConstructor(webhook.LogConstructor).
@@ -301,8 +316,7 @@ func start() {
 		os.Exit(1)
 	}
 
-	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&v1beta2.SparkApplication{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &v1beta2.SparkApplication{}).
 		WithDefaulter(webhook.NewSparkApplicationDefaulter()).
 		WithValidator(webhook.NewSparkApplicationValidator(mgr.GetClient(), enableResourceQuotaEnforcement)).
 		WithLogConstructor(webhook.LogConstructor).
@@ -311,8 +325,7 @@ func start() {
 		os.Exit(1)
 	}
 
-	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&v1beta2.ScheduledSparkApplication{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &v1beta2.ScheduledSparkApplication{}).
 		WithDefaulter(webhook.NewScheduledSparkApplicationDefaulter()).
 		WithValidator(webhook.NewScheduledSparkApplicationValidator()).
 		WithLogConstructor(webhook.LogConstructor).
@@ -321,8 +334,7 @@ func start() {
 		os.Exit(1)
 	}
 
-	if err := ctrl.NewWebhookManagedBy(mgr).
-		For(&corev1.Pod{}).
+	if err := ctrl.NewWebhookManagedBy(mgr, &corev1.Pod{}).
 		WithDefaulter(webhook.NewSparkPodDefaulter(mgr.GetClient(), namespaces)).
 		WithLogConstructor(webhook.LogConstructor).
 		Complete(); err != nil {
@@ -365,25 +377,6 @@ func setupLog() {
 	)
 }
 
-func newTLSOptions() []func(c *tls.Config) {
-	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	disableHTTP2 := func(c *tls.Config) {
-		logger.Info("disabling http/2")
-		c.NextProtos = []string{"http/1.1"}
-	}
-
-	tlsOpts := []func(*tls.Config){}
-	if !enableHTTP2 {
-		tlsOpts = append(tlsOpts, disableHTTP2)
-	}
-	return tlsOpts
-}
-
 // newCacheOptions creates and returns a cache.Options instance configured with default namespaces and object caching settings.
 func newCacheOptions() cache.Options {
 	defaultNamespaces := make(map[string]cache.Config)
@@ -399,6 +392,7 @@ func newCacheOptions() cache.Options {
 				common.LabelLaunchedBySparkOperator: "true",
 			}),
 		},
+		&corev1.ResourceQuota{}:              {},
 		&v1beta2.SparkApplication{}:          {},
 		&v1beta2.ScheduledSparkApplication{}: {},
 		&admissionregistrationv1.MutatingWebhookConfiguration{}: {
@@ -413,13 +407,10 @@ func newCacheOptions() cache.Options {
 		},
 	}
 
-	if enableResourceQuotaEnforcement {
-		byObject[&corev1.ResourceQuota{}] = cache.ByObject{}
-	}
-
 	options := cache.Options{
 		Scheme:            operatorscheme.WebhookScheme,
 		DefaultNamespaces: defaultNamespaces,
+		DefaultTransform:  cache.TransformStripManagedFields(),
 		ByObject:          byObject,
 	}
 

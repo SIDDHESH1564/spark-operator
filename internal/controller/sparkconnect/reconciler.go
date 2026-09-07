@@ -29,7 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -50,6 +50,8 @@ import (
 
 const (
 	ExecutorPodTemplateFileName = "executor-pod-template.yaml"
+
+	sparkConnectServerPort = 15002
 )
 
 // Options defines the options of SparkConnect reconciler.
@@ -57,6 +59,11 @@ type Options struct {
 	// A list of namespaces that should be watched.
 	Namespaces        []string
 	NamespaceSelector string
+
+	// DefaultServiceAccount is the name of the service account used by the Spark Connect
+	// server pod when neither the SparkConnect nor its server pod template specifies one.
+	// An empty value disables the fallback.
+	DefaultServiceAccount string
 }
 
 // Reconciler reconciles a SparkConnect object.
@@ -64,7 +71,7 @@ type Reconciler struct {
 	manager  ctrl.Manager
 	scheme   *runtime.Scheme
 	client   client.Client
-	recorder record.EventRecorder
+	recorder events.EventRecorder
 	options  Options
 }
 
@@ -76,7 +83,7 @@ func NewReconciler(
 	manager ctrl.Manager,
 	scheme *runtime.Scheme,
 	client client.Client,
-	recorder record.EventRecorder,
+	recorder events.EventRecorder,
 	options Options,
 ) *Reconciler {
 	return &Reconciler{
@@ -339,7 +346,7 @@ func (r *Reconciler) createOrUpdateServerPod(ctx context.Context, conn *v1alpha1
 }
 
 // mutateServerPod mutates the server pod for SparkConnect.
-func (r *Reconciler) mutateServerPod(_ context.Context, conn *v1alpha1.SparkConnect, pod *corev1.Pod) error {
+func (r *Reconciler) mutateServerPod(ctx context.Context, conn *v1alpha1.SparkConnect, pod *corev1.Pod) error {
 	// Server pod not created yet.
 	if pod.CreationTimestamp.IsZero() {
 		template := conn.Spec.Server.Template
@@ -349,6 +356,14 @@ func (r *Reconciler) mutateServerPod(_ context.Context, conn *v1alpha1.SparkConn
 			pod.Spec = template.Spec
 		}
 
+		// Fall back to the operator-level default service account. This must happen after the
+		// pod template has been copied above, which would otherwise overwrite it.
+		if pod.Spec.ServiceAccountName == "" && r.options.DefaultServiceAccount != "" {
+			pod.Spec.ServiceAccountName = r.options.DefaultServiceAccount
+			ctrl.LoggerFrom(ctx).Info("Applied default service account to Spark Connect server pod",
+				"serviceAccount", r.options.DefaultServiceAccount)
+		}
+
 		// Add a default server container if not specified.
 		if len(pod.Spec.Containers) == 0 {
 			pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{
@@ -356,17 +371,11 @@ func (r *Reconciler) mutateServerPod(_ context.Context, conn *v1alpha1.SparkConn
 			})
 		}
 
-		index := 0
-		for i, container := range pod.Spec.Containers {
-			if container.Name == common.SparkDriverContainerName {
-				index = i
-				break
-			}
-		}
-
 		// Build Spark connect server container.
-		container := &pod.Spec.Containers[index]
-
+		container := util.GetContainerByNameOrFirst(
+			pod.Spec.Containers,
+			common.SparkDriverContainerName,
+		)
 		// Setup image.
 		if container.Image == "" {
 			if conn.Spec.Image == nil || *conn.Spec.Image == "" {
@@ -382,6 +391,8 @@ func (r *Reconciler) mutateServerPod(_ context.Context, conn *v1alpha1.SparkConn
 			return fmt.Errorf("failed to build spark connection args: %v", err)
 		}
 		container.Args = []string{strings.Join(args, " ")}
+
+		setDefaultSparkConnectServerProbes(container)
 
 		// Setup environment variables.
 		container.Env = append(
@@ -461,6 +472,42 @@ func (r *Reconciler) mutateServerPod(_ context.Context, conn *v1alpha1.SparkConn
 	return nil
 }
 
+func setDefaultSparkConnectServerProbes(container *corev1.Container) {
+	if container.StartupProbe == nil {
+		container.StartupProbe = newSparkConnectServerStartupProbe()
+	}
+	if container.ReadinessProbe == nil {
+		container.ReadinessProbe = newSparkConnectServerReadinessProbe()
+	}
+}
+
+func newSparkConnectServerStartupProbe() *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{
+				Port: intstr.FromInt(sparkConnectServerPort),
+			},
+		},
+		InitialDelaySeconds: 5,
+		PeriodSeconds:       10,
+		TimeoutSeconds:      1,
+		FailureThreshold:    30,
+	}
+}
+
+func newSparkConnectServerReadinessProbe() *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{
+				Port: intstr.FromInt(sparkConnectServerPort),
+			},
+		},
+		PeriodSeconds:    10,
+		TimeoutSeconds:   1,
+		FailureThreshold: 3,
+	}
+}
+
 // createOrUpdateServerService creates or updates the server service for the SparkConnect resource.
 func (r *Reconciler) createOrUpdateServerService(ctx context.Context, conn *v1alpha1.SparkConnect) error {
 	logger := ctrl.LoggerFrom(ctx)
@@ -524,8 +571,8 @@ func (r *Reconciler) mutateServerService(_ context.Context, conn *v1alpha1.Spark
 			},
 			{
 				Name:        "spark-connect-server",
-				Port:        15002,
-				TargetPort:  intstr.FromInt(15002),
+				Port:        sparkConnectServerPort,
+				TargetPort:  intstr.FromInt(sparkConnectServerPort),
 				Protocol:    corev1.ProtocolTCP,
 				AppProtocol: ptr.To("grpc"),
 			},

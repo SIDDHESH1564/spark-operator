@@ -18,6 +18,7 @@ package webhook
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"reflect"
 	"slices"
@@ -26,7 +27,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -50,7 +50,7 @@ type SparkPodDefaulter struct {
 }
 
 // SparkPodDefaulter implements admission.CustomDefaulter.
-var _ admission.CustomDefaulter = &SparkPodDefaulter{}
+var _ admission.Defaulter[*corev1.Pod] = &SparkPodDefaulter{}
 
 // NewSparkPodDefaulter creates a new SparkPodDefaulter instance.
 func NewSparkPodDefaulter(client client.Client, namespaces []string) *SparkPodDefaulter {
@@ -69,10 +69,9 @@ func NewSparkPodDefaulter(client client.Client, namespaces []string) *SparkPodDe
 	}
 }
 
-// Default implements admission.CustomDefaulter.
-func (d *SparkPodDefaulter) Default(ctx context.Context, obj runtime.Object) error {
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
+// Default implements admission.Defaulter.
+func (d *SparkPodDefaulter) Default(ctx context.Context, pod *corev1.Pod) error {
+	if pod == nil {
 		return nil
 	}
 
@@ -336,13 +335,8 @@ func addGeneralConfigMaps(pod *corev1.Pod, app *v1beta2.SparkApplication) error 
 		configMaps = app.Spec.Executor.ConfigMaps
 	}
 
-	logger := log.FromContext(context.TODO())
 	for _, namePath := range configMaps {
-		volumeName := namePath.Name + "-vol"
-		if len(volumeName) > maxNameLength {
-			volumeName = volumeName[0:maxNameLength]
-			logger.Info("ConfigMap volume name is too long. Truncating", "result", volumeName)
-		}
+		volumeName := getConfigMapVolumeName(namePath.Name)
 		if err := addConfigMapVolume(pod, namePath.Name, volumeName); err != nil {
 			return err
 		}
@@ -352,6 +346,26 @@ func addGeneralConfigMaps(pod *corev1.Pod, app *v1beta2.SparkApplication) error 
 		}
 	}
 	return nil
+}
+
+func getConfigMapVolumeName(configMapName string) string {
+	const volumeSuffix = "-vol"
+	preferredName := configMapName + volumeSuffix
+	if len(preferredName) <= maxNameLength && !strings.Contains(preferredName, ".") {
+		return preferredName
+	}
+
+	// ConfigMap names are DNS subdomains and may contain dots, while volume names
+	// must be DNS labels. Add a hash so sanitizing or truncating stays unique.
+	sanitizedName := strings.ReplaceAll(configMapName, ".", "-")
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(configMapName)))[:8]
+	hashedSuffix := "-" + hash + volumeSuffix
+	maxPrefixLength := maxNameLength - len(hashedSuffix)
+	if len(sanitizedName) > maxPrefixLength {
+		sanitizedName = sanitizedName[:maxPrefixLength]
+	}
+	sanitizedName = strings.TrimRight(sanitizedName, "-")
+	return sanitizedName + hashedSuffix
 }
 
 func addPrometheusConfig(pod *corev1.Pod, app *v1beta2.SparkApplication) error {
@@ -369,7 +383,7 @@ func addPrometheusConfig(pod *corev1.Pod, app *v1beta2.SparkApplication) error {
 	}
 
 	name := util.GetPrometheusConfigMapName(app)
-	volumeName := name + "-vol"
+	volumeName := getConfigMapVolumeName(name)
 	mountPath := common.PrometheusConfigMapMountPath
 	promPort := common.DefaultPrometheusJavaAgentPort
 	if app.Spec.Monitoring.Prometheus.Port != nil {

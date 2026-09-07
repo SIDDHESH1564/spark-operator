@@ -22,7 +22,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -123,25 +123,27 @@ func (f *sparkPodEventFilter) filter(pod *corev1.Pod) bool {
 }
 
 type EventFilter struct {
-	client           client.Client
-	recorder         record.EventRecorder
-	namespaceMatcher *util.NamespaceMatcher
-	logger           logr.Logger
+	client                   client.Client
+	recorder                 events.EventRecorder
+	namespaceMatcher         *util.NamespaceMatcher
+	logger                   logr.Logger
+	defaultTimeToLiveSeconds int64
 }
 
 var _ predicate.Predicate = &EventFilter{}
 
-func NewSparkApplicationEventFilter(client client.Client, recorder record.EventRecorder, namespaces []string, namespaceSelector string) (*EventFilter, error) {
+func NewSparkApplicationEventFilter(client client.Client, recorder events.EventRecorder, namespaces []string, namespaceSelector string, defaultTimeToLiveSeconds int64) (*EventFilter, error) {
 	matcher, err := util.NewNamespaceMatcher(namespaces, namespaceSelector)
 	if err != nil {
 		return nil, err
 	}
 
 	return &EventFilter{
-		client:           client,
-		recorder:         recorder,
-		namespaceMatcher: matcher,
-		logger:           log.Log.WithName("spark-application-event-filter"),
+		client:                   client,
+		recorder:                 recorder,
+		namespaceMatcher:         matcher,
+		logger:                   log.Log.WithName("spark-application-event-filter"),
+		defaultTimeToLiveSeconds: defaultTimeToLiveSeconds,
 	}, nil
 }
 
@@ -171,7 +173,13 @@ func (f *EventFilter) Update(e event.UpdateEvent) bool {
 		return false
 	}
 
-	if oldApp.ResourceVersion == newApp.ResourceVersion && !util.IsExpired(newApp) && !util.ShouldRetry(newApp) {
+	// On a no-op resync (same ResourceVersion), only re-admit the event when the
+	// application still needs action: it is expired (needs deletion) or should
+	// retry. Expiry uses the effective TTL so that an app expired via the
+	// operator default TTL is reconciled for deletion, consistent with the
+	// controller's own cleanup decision.
+	effectiveTTLSeconds, _ := util.EffectiveTimeToLiveSeconds(newApp, f.defaultTimeToLiveSeconds)
+	if oldApp.ResourceVersion == newApp.ResourceVersion && !util.IsExpired(newApp, effectiveTTLSeconds) && !util.ShouldRetry(newApp) {
 		return false
 	}
 
@@ -197,6 +205,7 @@ func (f *EventFilter) Update(e event.UpdateEvent) bool {
 				"name", newApp.Name, "namespace", newApp.Namespace)
 			f.recorder.Eventf(
 				newApp,
+				nil,
 				corev1.EventTypeNormal,
 				"SparkApplicationWebhookFieldsUpdated",
 				"SparkApplication %s webhook-patched fields updated, new pods will use updated values",
@@ -212,6 +221,7 @@ func (f *EventFilter) Update(e event.UpdateEvent) bool {
 			f.logger.Error(err, "Failed to update application status", "application", newApp.Name)
 			f.recorder.Eventf(
 				newApp,
+				nil,
 				corev1.EventTypeWarning,
 				"SparkApplicationSpecUpdateFailed",
 				"Failed to update spec for SparkApplication %s: %v",

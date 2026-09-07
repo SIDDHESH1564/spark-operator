@@ -17,12 +17,13 @@ limitations under the License.
 package controller
 
 import (
-	"crypto/tls"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -30,7 +31,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	// Import features package to register feature gates.
-	_ "github.com/kubeflow/spark-operator/v2/pkg/features"
+	"github.com/kubeflow/spark-operator/v2/pkg/features"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/rest"
 
@@ -40,8 +41,11 @@ import (
 	"go.uber.org/zap/zapcore"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
+	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -52,6 +56,8 @@ import (
 	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	operatortls "github.com/kubeflow/spark-operator/v2/pkg/tls"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1alpha1"
 	"github.com/kubeflow/spark-operator/v2/api/v1beta2"
@@ -82,6 +88,13 @@ var (
 	controllerThreads        int
 	cacheSyncTimeout         time.Duration
 	maxTrackedExecutorPerApp int
+	defaultTimeToLiveSeconds int64
+
+	// Driver PDB feature gate. When enabled, the controller creates a
+	// PodDisruptionBudget for each SparkApplication that sets
+	// spec.driverPodDisruptionBudget=true. Defaults to false so the upgrade
+	// path is no-op for existing clusters.
+	enableDriverPDB bool
 
 	//WorkQueue
 	workqueueRateLimiterBucketQPS  int
@@ -92,6 +105,10 @@ var (
 	enableBatchScheduler  bool
 	kubeSchedulerNames    []string
 	defaultBatchScheduler string
+
+	// Fallback service account for Spark driver pods when the custom resource does
+	// not specify one. Empty by default, which preserves existing behavior.
+	defaultServiceAccount string
 
 	// Spark web UI service and ingress
 	enableUIService    bool
@@ -126,10 +143,22 @@ var (
 	healthProbeBindAddress                      string
 	pprofBindAddress                            string
 	secureMetrics                               bool
-	enableHTTP2                                 bool
+	tlsMinVersion                               string
+	tlsCipherSuites                             []string
 	scheduledSparkApplicationTimestampPrecision string
 	development                                 bool
 	zapOptions                                  = logzap.Options{}
+
+	// REST submitter (behind RestSubmitter feature gate)
+	submitterServiceURL     string
+	submitterStartupTimeout time.Duration
+	submitterRequestTimeout time.Duration
+	submitterMaxRetries     int
+	submitterInitialBackoff time.Duration
+	submitterTLSEnabled     bool
+	submitterTLSCertFile    string
+	submitterTLSKeyFile     string
+	submitterTLSCAFile      string
 )
 
 func NewStartCommand() *cobra.Command {
@@ -157,6 +186,32 @@ func NewStartCommand() *cobra.Command {
 				return fmt.Errorf("invalid value %q for --scheduled-spark-application-timestamp-precision, valid values: %v", scheduledSparkApplicationTimestampPrecision, validPrecisions)
 			}
 
+			if features.Enabled(features.RestSubmitter) {
+				if submitterServiceURL == "" {
+					return fmt.Errorf("--submitter-service-url is required when RestSubmitter feature gate is enabled")
+				}
+				if submitterMaxRetries < 1 {
+					return fmt.Errorf("invalid value %d for --submitter-max-retries, must be at least 1", submitterMaxRetries)
+				}
+				if submitterTLSEnabled {
+					if submitterTLSCertFile == "" || submitterTLSKeyFile == "" || submitterTLSCAFile == "" {
+						return fmt.Errorf("--submitter-tls-enabled requires --submitter-tls-cert-file, --submitter-tls-key-file, and --submitter-tls-ca-file")
+					}
+				}
+			}
+
+			// A negative TTL is never meaningful; reject it regardless of the gate.
+			// Zero is the valid "off" sentinel and is left untouched.
+			if defaultTimeToLiveSeconds < 0 {
+				return fmt.Errorf("invalid value %d for --default-time-to-live-seconds, must not be negative", defaultTimeToLiveSeconds)
+			}
+
+			if defaultServiceAccount != "" {
+				if errs := validation.IsDNS1123Subdomain(defaultServiceAccount); len(errs) > 0 {
+					return fmt.Errorf("invalid value %q for --default-service-account: %s", defaultServiceAccount, strings.Join(errs, ", "))
+				}
+			}
+
 			return nil
 		},
 		Run: func(_ *cobra.Command, args []string) {
@@ -170,6 +225,18 @@ func NewStartCommand() *cobra.Command {
 	command.Flags().StringVar(&namespaceSelector, "namespace-selector", "", "Label selector for namespaces to watch (e.g., 'spark-operator=enabled,env in (prod,staging)'). Namespaces matching this selector will be watched in addition to those specified via --namespaces. Requires ClusterRole permission to list and watch namespaces.")
 	command.Flags().DurationVar(&cacheSyncTimeout, "cache-sync-timeout", 30*time.Second, "Informer cache sync timeout.")
 	command.Flags().IntVar(&maxTrackedExecutorPerApp, "max-tracked-executor-per-app", 1000, "The maximum number of tracked executors per SparkApplication.")
+	command.Flags().Int64Var(&defaultTimeToLiveSeconds, "default-time-to-live-seconds", 0,
+		"Default Time-To-Live in seconds applied to terminated SparkApplications that do "+
+			"not set spec.timeToLiveSeconds. Requires the DefaultTimeToLive feature gate. "+
+			"0 (default) disables it; a negative value is rejected.")
+	command.Flags().StringVar(&defaultServiceAccount, "default-service-account", "",
+		"The service account used by the Spark driver pod and the Spark Connect server pod "+
+			"when neither the custom resource nor its pod template specifies one. Leave empty "+
+			"to disable the fallback, in which case the namespace's default service account is used.")
+	command.Flags().BoolVar(&enableDriverPDB, "enable-driver-pdb", false,
+		"Enable creation of a PodDisruptionBudget for Spark driver pods. "+
+			"Each SparkApplication must additionally opt in via "+
+			"spec.driverPodDisruptionBudget=true.")
 
 	command.Flags().IntVar(&workqueueRateLimiterBucketQPS, "workqueue-ratelimiter-bucket-qps", 10, "QPS of the bucket rate of the workqueue.")
 	command.Flags().IntVar(&workqueueRateLimiterBucketSize, "workqueue-ratelimiter-bucket-size", 100, "The token bucket size of the workqueue.")
@@ -209,12 +276,29 @@ func NewStartCommand() *cobra.Command {
 
 	command.Flags().StringVar(&healthProbeBindAddress, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	command.Flags().BoolVar(&secureMetrics, "secure-metrics", false, "If set the metrics endpoint is served securely")
-	command.Flags().BoolVar(&enableHTTP2, "enable-http2", false, "If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	command.Flags().StringVar(&tlsMinVersion, "metric-tls-min-version", "VersionTLS12",
+		"Minimum TLS version for the metrics server. "+
+			"Possible values: VersionTLS12, VersionTLS13")
+	command.Flags().StringSliceVar(&tlsCipherSuites, "metric-tls-cipher-suites", []string{},
+		"Comma-separated list of cipher suites for the metrics server. "+
+			"If omitted, the default Go cipher suites are used. "+
+			"Applies to TLS 1.2 only; TLS 1.3 cipher suites are not configurable in Go. Possible values listed at https://pkg.go.dev/crypto/tls#CipherSuites")
 
 	command.Flags().StringVar(&pprofBindAddress, "pprof-bind-address", "0", "The address the pprof endpoint binds to. "+
 		"If not set, it will be 0 in order to disable the pprof server")
 
 	command.Flags().StringVar(&scheduledSparkApplicationTimestampPrecision, "scheduled-spark-application-timestamp-precision", "nanos", "Timestamp precision for ScheduledSparkApplication run names. Valid values: nanos, micros, millis, seconds, minutes.")
+
+	// REST submitter flags (used when RestSubmitter feature gate is enabled)
+	command.Flags().StringVar(&submitterServiceURL, "submitter-service-url", "", "Full submit endpoint URL of the submitter service (required when RestSubmitter feature gate is enabled).")
+	command.Flags().DurationVar(&submitterStartupTimeout, "submitter-startup-timeout", 5*time.Minute, "How long the controller waits for the submitter service to become reachable at startup.")
+	command.Flags().DurationVar(&submitterRequestTimeout, "submitter-request-timeout", 2*time.Minute, "HTTP request timeout per spark submission attempt.")
+	command.Flags().IntVar(&submitterMaxRetries, "submitter-max-retries", 3, "Max retry attempts for transient spark submission failures.")
+	command.Flags().DurationVar(&submitterInitialBackoff, "submitter-initial-backoff", 2*time.Second, "Initial backoff duration before the first retry.")
+	command.Flags().BoolVar(&submitterTLSEnabled, "submitter-tls-enabled", false, "Enable mTLS for communication with the submitter service.")
+	command.Flags().StringVar(&submitterTLSCertFile, "submitter-tls-cert-file", "", "Path to the client certificate file for mTLS with the submitter service.")
+	command.Flags().StringVar(&submitterTLSKeyFile, "submitter-tls-key-file", "", "Path to the client private key file for mTLS with the submitter service.")
+	command.Flags().StringVar(&submitterTLSCAFile, "submitter-tls-ca-file", "", "Path to the CA certificate file for verifying the submitter service.")
 
 	flagSet := flag.NewFlagSet("controller", flag.ExitOnError)
 	ctrl.RegisterFlags(flagSet)
@@ -229,6 +313,16 @@ func NewStartCommand() *cobra.Command {
 func start() {
 	setupLog()
 
+	// Normalize the configured TTL before passing it to the controller so downstream
+	// cleanup logic does not need to depend on the global feature gate.
+	if !features.Enabled(features.DefaultTimeToLive) {
+		if defaultTimeToLiveSeconds > 0 {
+			logger.Info("Ignoring --default-time-to-live-seconds because the DefaultTimeToLive feature gate is disabled",
+				"defaultTimeToLiveSeconds", defaultTimeToLiveSeconds)
+		}
+		defaultTimeToLiveSeconds = 0
+	}
+
 	// Create the client rest config. Use kubeConfig if given, otherwise assume in-cluster.
 	cfg, err := ctrl.GetConfig()
 	cfg.WarningHandler = rest.NoWarnings{}
@@ -241,10 +335,24 @@ func start() {
 	cfg.Burst = kubeAPIBurst
 
 	// Create the manager.
-	tlsOptions := newTLSOptions()
+	tlsOptions, err := operatortls.SetupTLS(tlsMinVersion, tlsCipherSuites)
+	if err != nil {
+		logger.Error(err, "Failed to set up TLS")
+		os.Exit(1)
+	}
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: operatorscheme.ControllerScheme,
 		Cache:  newCacheOptions(),
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				// TODO: If Ingress reconciliation is added, move these to ByObject with a label selector.
+				// Currently write-only (created with OwnerReferences, no Watches/Owns registered).
+				DisableFor: []client.Object{
+					&networkingv1.Ingress{},
+					&extensionsv1beta1.Ingress{},
+				},
+			},
+		},
 		Metrics: metricsserver.Options{
 			BindAddress:   metricsBindAddress,
 			SecureServing: secureMetrics,
@@ -307,14 +415,20 @@ func start() {
 		}
 	}
 
-	sparkSubmitter := &sparkapplication.SparkSubmitter{}
+	ctx := ctrl.SetupSignalHandler()
+
+	sparkSubmitter, err := newSparkSubmitter(ctx)
+	if err != nil {
+		logger.Error(err, "Failed to create spark submitter")
+		os.Exit(1)
+	}
 
 	// Setup controller for SparkApplication.
 	if err = sparkapplication.NewReconciler(
 		mgr,
 		mgr.GetScheme(),
 		mgr.GetClient(),
-		mgr.GetEventRecorderFor("spark-application-controller"),
+		mgr.GetEventRecorder("spark-application-controller"),
 		registry,
 		sparkSubmitter,
 		newSparkApplicationReconcilerOptions(),
@@ -327,7 +441,7 @@ func start() {
 	if err = scheduledsparkapplication.NewReconciler(
 		mgr.GetScheme(),
 		mgr.GetClient(),
-		mgr.GetEventRecorderFor("scheduled-spark-application-controller"),
+		mgr.GetEventRecorder("scheduled-spark-application-controller"),
 		clock.RealClock{},
 		newScheduledSparkApplicationReconcilerOptions(),
 	).SetupWithManager(mgr, newControllerOptions()); err != nil {
@@ -340,7 +454,7 @@ func start() {
 		mgr,
 		mgr.GetScheme(),
 		mgr.GetClient(),
-		mgr.GetEventRecorderFor("SparkConnect"),
+		mgr.GetEventRecorder("SparkConnect"),
 		newSparkConnectReconcilerOptions(),
 	).SetupWithManager(mgr, newControllerOptions()); err != nil {
 		logger.Error(err, "Failed to create controller", "controller", "SparkConnect")
@@ -360,7 +474,7 @@ func start() {
 	}
 
 	logger.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		logger.Error(err, "Failed to start manager")
 		os.Exit(1)
 	}
@@ -382,25 +496,6 @@ func setupLog() {
 	)
 }
 
-func newTLSOptions() []func(c *tls.Config) {
-	// if the enable-http2 flag is false (the default), http/2 should be disabled
-	// due to its vulnerabilities. More specifically, disabling http/2 will
-	// prevent from being vulnerable to the HTTP/2 Stream Cancellation and
-	// Rapid Reset CVEs. For more information see:
-	// - https://github.com/advisories/GHSA-qppj-fm5r-hxr3
-	// - https://github.com/advisories/GHSA-4374-p667-p6c8
-	disableHTTP2 := func(c *tls.Config) {
-		logger.Info("disabling http/2")
-		c.NextProtos = []string{"http/1.1"}
-	}
-
-	tlsOpts := []func(*tls.Config){}
-	if !enableHTTP2 {
-		tlsOpts = append(tlsOpts, disableHTTP2)
-	}
-	return tlsOpts
-}
-
 // newCacheOptions creates and returns a cache.Options instance configured with default namespaces and object caching settings.
 func newCacheOptions() cache.Options {
 	var defaultNamespaces map[string]cache.Config
@@ -420,6 +515,7 @@ func newCacheOptions() cache.Options {
 	options := cache.Options{
 		Scheme:            operatorscheme.ControllerScheme,
 		DefaultNamespaces: defaultNamespaces,
+		DefaultTransform:  cache.TransformStripManagedFields(),
 		ByObject: map[client.Object]cache.ByObject{
 			&corev1.Namespace{}: {},
 			&corev1.Pod{}: {
@@ -432,11 +528,19 @@ func newCacheOptions() cache.Options {
 					common.LabelCreatedBySparkOperator: "true",
 				}),
 			},
-			&corev1.PersistentVolumeClaim{}:      {},
-			&corev1.Service{}:                    {},
+			&corev1.Service{}: {
+				Label: labels.SelectorFromSet(labels.Set{
+					common.LabelCreatedBySparkOperator: "true",
+				}),
+			},
 			&v1beta2.SparkApplication{}:          {},
 			&v1beta2.ScheduledSparkApplication{}: {},
 			&v1alpha1.SparkConnect{}:             {},
+			&policyv1.PodDisruptionBudget{}: {
+				Label: labels.SelectorFromSet(labels.Set{
+					common.LabelLaunchedBySparkOperator: "true",
+				}),
+			},
 		},
 	}
 
@@ -475,6 +579,9 @@ func newSparkApplicationReconcilerOptions() sparkapplication.Options {
 		SparkApplicationMetrics:      sparkApplicationMetrics,
 		SparkExecutorMetrics:         sparkExecutorMetrics,
 		MaxTrackedExecutorPerApp:     maxTrackedExecutorPerApp,
+		EnableDriverPDB:              enableDriverPDB,
+		DefaultTimeToLiveSeconds:     defaultTimeToLiveSeconds,
+		DefaultServiceAccount:        defaultServiceAccount,
 	}
 	if enableBatchScheduler {
 		options.KubeSchedulerNames = kubeSchedulerNames
@@ -493,8 +600,45 @@ func newScheduledSparkApplicationReconcilerOptions() scheduledsparkapplication.O
 
 func newSparkConnectReconcilerOptions() sparkconnect.Options {
 	options := sparkconnect.Options{
-		Namespaces:        namespaces,
-		NamespaceSelector: namespaceSelector,
+		Namespaces:            namespaces,
+		NamespaceSelector:     namespaceSelector,
+		DefaultServiceAccount: defaultServiceAccount,
 	}
 	return options
+}
+
+func newSparkSubmitter(ctx context.Context) (sparkapplication.SparkApplicationSubmitter, error) {
+	if !features.Enabled(features.RestSubmitter) {
+		return &sparkapplication.SparkSubmitter{}, nil
+	}
+
+	var tlsCfg *sparkapplication.TLSConfig
+	if submitterTLSEnabled {
+		tlsCfg = &sparkapplication.TLSConfig{
+			Enabled:    true,
+			CertFile:   submitterTLSCertFile,
+			KeyFile:    submitterTLSKeyFile,
+			CACertFile: submitterTLSCAFile,
+		}
+	}
+
+	submitter, err := sparkapplication.NewRestSparkSubmitter(sparkapplication.RestSparkSubmitterConfig{
+		URL:             submitterServiceURL,
+		RetryMaxRetries: submitterMaxRetries,
+		RequestTimeout:  submitterRequestTimeout,
+		InitialBackoff:  submitterInitialBackoff,
+		TLS:             tlsCfg,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize RestSubmitter: %w", err)
+	}
+
+	startupCtx, cancel := context.WithTimeout(ctx, submitterStartupTimeout)
+	defer cancel()
+	if err := submitter.WaitForConnection(startupCtx); err != nil {
+		return nil, fmt.Errorf("RestSubmitter service not reachable at startup: %w", err)
+	}
+
+	logger.Info("Using REST submitter service", "url", submitterServiceURL)
+	return submitter, nil
 }

@@ -124,72 +124,90 @@ var _ = Describe("GetApplicationState", func() {
 })
 
 var _ = Describe("IsExpired", func() {
-	Context("SparkApplication without TTL", func() {
-		app := &v1beta2.SparkApplication{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "test-app",
-				Namespace: "test-namespace",
-			},
-		}
-
-		It("Should return false", func() {
-			Expect(util.IsExpired(app)).To(BeFalse())
-		})
-	})
-
-	Context("SparkApplication not terminated with TTL", func() {
-		app := &v1beta2.SparkApplication{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "test-app",
-				Namespace: "test-namespace",
-			},
-			Spec: v1beta2.SparkApplicationSpec{
-				TimeToLiveSeconds: ptr.To[int64](3600),
-			},
-		}
-
-		It("Should return false", func() {
-			Expect(util.IsExpired(app)).To(BeFalse())
-		})
-	})
-
-	Context("SparkApplication terminated with TTL not expired", func() {
-		now := time.Now()
-		app := &v1beta2.SparkApplication{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "test-app",
-				Namespace: "test-namespace",
-			},
-			Spec: v1beta2.SparkApplicationSpec{
-				TimeToLiveSeconds: ptr.To[int64](3600),
-			},
+	terminatedApp := func(sinceTermination time.Duration) *v1beta2.SparkApplication {
+		return &v1beta2.SparkApplication{
 			Status: v1beta2.SparkApplicationStatus{
-				TerminationTime: metav1.NewTime(now.Add(-30 * time.Minute)),
+				TerminationTime: metav1.NewTime(time.Now().Add(-sinceTermination)),
 			},
 		}
+	}
 
-		It("Should return false", func() {
-			Expect(util.IsExpired(app)).To(BeFalse())
+	Context("with a nil TTL", func() {
+		It("never expires", func() {
+			Expect(util.IsExpired(terminatedApp(time.Hour), nil)).To(BeFalse())
 		})
 	})
 
-	Context("SparkApplication terminated with TTL expired", func() {
-		now := time.Now()
-		app := &v1beta2.SparkApplication{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "test-app",
-				Namespace: "test-namespace",
-			},
-			Spec: v1beta2.SparkApplicationSpec{
-				TimeToLiveSeconds: ptr.To[int64](3600),
-			},
-			Status: v1beta2.SparkApplicationStatus{
-				TerminationTime: metav1.NewTime(now.Add(-2 * time.Hour)),
-			},
-		}
+	Context("with a positive TTL", func() {
+		It("returns false before the TTL elapses", func() {
+			Expect(util.IsExpired(terminatedApp(30*time.Minute), ptr.To[int64](3600))).To(BeFalse())
+		})
 
-		It("Should return true", func() {
-			Expect(util.IsExpired(app)).To(BeTrue())
+		It("returns true after the TTL elapses", func() {
+			Expect(util.IsExpired(terminatedApp(2*time.Hour), ptr.To[int64](3600))).To(BeTrue())
+		})
+	})
+
+	Context("with a non-positive TTL on a terminated app", func() {
+		It("expires immediately for a zero TTL", func() {
+			Expect(util.IsExpired(terminatedApp(time.Second), ptr.To[int64](0))).To(BeTrue())
+		})
+
+		It("expires immediately for a negative TTL", func() {
+			Expect(util.IsExpired(terminatedApp(time.Second), ptr.To[int64](-5))).To(BeTrue())
+		})
+	})
+
+	Context("with no termination time", func() {
+		It("does not expire even for a zero TTL", func() {
+			app := &v1beta2.SparkApplication{}
+			Expect(util.IsExpired(app, ptr.To[int64](0))).To(BeFalse())
+		})
+	})
+})
+
+var _ = Describe("EffectiveTimeToLiveSeconds", func() {
+	appWithTTL := func(ttl *int64) *v1beta2.SparkApplication {
+		return &v1beta2.SparkApplication{
+			Spec: v1beta2.SparkApplicationSpec{TimeToLiveSeconds: ttl},
+		}
+	}
+
+	Context("when the user sets spec.timeToLiveSeconds > 0", func() {
+		It("returns the user value regardless of the default", func() {
+			ttl, usedDefault := util.EffectiveTimeToLiveSeconds(appWithTTL(ptr.To[int64](3600)), 60)
+			Expect(ttl).NotTo(BeNil())
+			Expect(*ttl).To(Equal(int64(3600)))
+			Expect(usedDefault).To(BeFalse())
+		})
+	})
+
+	Context("when the user sets a non-positive spec.timeToLiveSeconds", func() {
+		It("returns the user value as-is (explicit immediate expiry wins over the default)", func() {
+			ttl, usedDefault := util.EffectiveTimeToLiveSeconds(appWithTTL(ptr.To[int64](0)), 60)
+			Expect(ttl).NotTo(BeNil())
+			Expect(*ttl).To(Equal(int64(0)))
+			Expect(usedDefault).To(BeFalse())
+
+			ttl, usedDefault = util.EffectiveTimeToLiveSeconds(appWithTTL(ptr.To[int64](-5)), 60)
+			Expect(ttl).NotTo(BeNil())
+			Expect(*ttl).To(Equal(int64(-5)))
+			Expect(usedDefault).To(BeFalse())
+		})
+	})
+
+	Context("when no user TTL is set", func() {
+		It("returns the default and reports usedDefault=true", func() {
+			ttl, usedDefault := util.EffectiveTimeToLiveSeconds(appWithTTL(nil), 60)
+			Expect(ttl).NotTo(BeNil())
+			Expect(*ttl).To(Equal(int64(60)))
+			Expect(usedDefault).To(BeTrue())
+		})
+
+		It("returns nil when the default is not positive", func() {
+			ttl, usedDefault := util.EffectiveTimeToLiveSeconds(appWithTTL(nil), 0)
+			Expect(ttl).To(BeNil())
+			Expect(usedDefault).To(BeFalse())
 		})
 	})
 })
@@ -479,128 +497,76 @@ var _ = Describe("GetExecutorRequestResource", func() {
 	})
 })
 
-var _ = Describe("TimeUntilNextDeletionPollDue", func() {
-	Context("when OnFailureRetryInterval is not set", func() {
-		app := &v1beta2.SparkApplication{
-			Status: v1beta2.SparkApplicationStatus{
-				LastDeletionAttemptTime: metav1.Now(),
-				DeletionPollAttempts:    0,
+var _ = Describe("ApplyDefaultDriverServiceAccount", func() {
+	newApp := func() *v1beta2.SparkApplication {
+		return &v1beta2.SparkApplication{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "test-app",
+				Namespace: "test-namespace",
 			},
 		}
+	}
 
-		It("Should return an error", func() {
-			_, err := util.TimeUntilNextDeletionPollDue(app)
-			Expect(err).To(HaveOccurred())
+	Context("No default service account configured", func() {
+		It("Should return the application unchanged", func() {
+			app := newApp()
+			Expect(util.ApplyDefaultDriverServiceAccount(app, "")).To(BeIdenticalTo(app))
+			Expect(app.Spec.Driver.ServiceAccount).To(BeNil())
 		})
 	})
 
-	Context("when LastDeletionAttemptTime is not set", func() {
-		app := &v1beta2.SparkApplication{
-			Spec: v1beta2.SparkApplicationSpec{
-				RestartPolicy: v1beta2.RestartPolicy{
-					OnFailureRetryInterval: ptr.To[int64](5),
-				},
-			},
-		}
-
-		It("Should return an error", func() {
-			_, err := util.TimeUntilNextDeletionPollDue(app)
-			Expect(err).To(HaveOccurred())
+	Context("SparkApplication without a driver service account", func() {
+		It("Should apply the default service account", func() {
+			app := newApp()
+			got := util.ApplyDefaultDriverServiceAccount(app, "spark-operator-spark")
+			Expect(got).NotTo(BeIdenticalTo(app))
+			Expect(*got.Spec.Driver.ServiceAccount).To(Equal("spark-operator-spark"))
+			Expect(app.Spec.Driver.ServiceAccount).To(BeNil(), "the original application must not be mutated")
 		})
 	})
 
-	Context("when DeletionPollAttempts is 0 and deletion just started", func() {
-		It("Should return approximately 5s (n=1, offset=1*2/2*5s=5s)", func() {
-			app := &v1beta2.SparkApplication{
-				Spec: v1beta2.SparkApplicationSpec{
-					RestartPolicy: v1beta2.RestartPolicy{
-						OnFailureRetryInterval: ptr.To[int64](5),
-					},
-				},
-				Status: v1beta2.SparkApplicationStatus{
-					LastDeletionAttemptTime: metav1.NewTime(time.Now().Add(-100 * time.Millisecond)),
-					DeletionPollAttempts:    0,
-				},
-			}
-			dur, err := util.TimeUntilNextDeletionPollDue(app)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(dur).To(BeNumerically("~", 5*time.Second, 500*time.Millisecond))
+	Context("SparkApplication with an empty driver service account", func() {
+		It("Should apply the default service account", func() {
+			app := newApp()
+			app.Spec.Driver.ServiceAccount = ptr.To("")
+			got := util.ApplyDefaultDriverServiceAccount(app, "spark-operator-spark")
+			Expect(*got.Spec.Driver.ServiceAccount).To(Equal("spark-operator-spark"))
 		})
 	})
 
-	Context("when DeletionPollAttempts is 2", func() {
-		It("Should return approximately 30s (n=3, offset=3*4/2*5s=30s)", func() {
-			app := &v1beta2.SparkApplication{
-				Spec: v1beta2.SparkApplicationSpec{
-					RestartPolicy: v1beta2.RestartPolicy{
-						OnFailureRetryInterval: ptr.To[int64](5),
-					},
-				},
-				Status: v1beta2.SparkApplicationStatus{
-					LastDeletionAttemptTime: metav1.NewTime(time.Now().Add(-100 * time.Millisecond)),
-					DeletionPollAttempts:    2,
-				},
-			}
-			dur, err := util.TimeUntilNextDeletionPollDue(app)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(dur).To(BeNumerically("~", 30*time.Second, 500*time.Millisecond))
+	Context("SparkApplication with a driver service account", func() {
+		It("Should return the application unchanged", func() {
+			app := newApp()
+			app.Spec.Driver.ServiceAccount = ptr.To("custom-sa")
+			Expect(util.ApplyDefaultDriverServiceAccount(app, "spark-operator-spark")).To(BeIdenticalTo(app))
 		})
 	})
 
-	Context("when enough time has elapsed that the poll is overdue", func() {
-		It("Should return a non-positive duration (poll is overdue)", func() {
-			app := &v1beta2.SparkApplication{
-				Spec: v1beta2.SparkApplicationSpec{
-					RestartPolicy: v1beta2.RestartPolicy{
-						OnFailureRetryInterval: ptr.To[int64](5),
-					},
-				},
-				Status: v1beta2.SparkApplicationStatus{
-					LastDeletionAttemptTime: metav1.NewTime(time.Now().Add(-10 * time.Second)),
-					DeletionPollAttempts:    0,
+	Context("SparkApplication with a service account in the driver pod template", func() {
+		It("Should return the application unchanged", func() {
+			app := newApp()
+			app.Spec.Driver.Template = &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "template-sa",
 				},
 			}
-			dur, err := util.TimeUntilNextDeletionPollDue(app)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(dur).To(BeNumerically("<=", 0))
+			got := util.ApplyDefaultDriverServiceAccount(app, "spark-operator-spark")
+			Expect(got).To(BeIdenticalTo(app))
+			Expect(got.Spec.Driver.ServiceAccount).To(BeNil())
 		})
 	})
 
-	Context("when DeletionPollAttempts is very large", func() {
-		It("Should cap at maxDeletionPollDelay (5min) without overflow", func() {
-			app := &v1beta2.SparkApplication{
-				Spec: v1beta2.SparkApplicationSpec{
-					RestartPolicy: v1beta2.RestartPolicy{
-						OnFailureRetryInterval: ptr.To[int64](5),
-					},
-				},
-				Status: v1beta2.SparkApplicationStatus{
-					LastDeletionAttemptTime: metav1.Now(),
-					DeletionPollAttempts:    100000,
+	Context("SparkApplication with both a driver service account and a pod template service account", func() {
+		It("Should prefer the driver service account", func() {
+			app := newApp()
+			app.Spec.Driver.ServiceAccount = ptr.To("custom-sa")
+			app.Spec.Driver.Template = &corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					ServiceAccountName: "template-sa",
 				},
 			}
-			dur, err := util.TimeUntilNextDeletionPollDue(app)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(dur).To(BeNumerically(">", 0))
-			Expect(dur).To(BeNumerically("<=", 5*time.Minute))
-		})
-
-		It("Should not produce negative duration from overflow", func() {
-			app := &v1beta2.SparkApplication{
-				Spec: v1beta2.SparkApplicationSpec{
-					RestartPolicy: v1beta2.RestartPolicy{
-						OnFailureRetryInterval: ptr.To[int64](3600),
-					},
-				},
-				Status: v1beta2.SparkApplicationStatus{
-					LastDeletionAttemptTime: metav1.Now(),
-					DeletionPollAttempts:    2000000000,
-				},
-			}
-			dur, err := util.TimeUntilNextDeletionPollDue(app)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(dur).To(BeNumerically(">", 0))
-			Expect(dur).To(BeNumerically("<=", 5*time.Minute))
+			got := util.ApplyDefaultDriverServiceAccount(app, "spark-operator-spark")
+			Expect(*got.Spec.Driver.ServiceAccount).To(Equal("custom-sa"))
 		})
 	})
 })

@@ -21,13 +21,14 @@ import (
 	"fmt"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1alpha1"
+	"github.com/kubeflow/spark-operator/v2/pkg/common"
 	"github.com/kubeflow/spark-operator/v2/pkg/util"
 )
 
@@ -43,12 +44,11 @@ func NewSparkConnectValidator() *SparkConnectValidator {
 	return &SparkConnectValidator{}
 }
 
-var _ admission.CustomValidator = &SparkConnectValidator{}
+var _ admission.Validator[*v1alpha1.SparkConnect] = &SparkConnectValidator{}
 
-// ValidateCreate implements admission.CustomValidator.
-func (v *SparkConnectValidator) ValidateCreate(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
-	sc, ok := obj.(*v1alpha1.SparkConnect)
-	if !ok {
+// ValidateCreate implements admission.Validator.
+func (v *SparkConnectValidator) ValidateCreate(ctx context.Context, sc *v1alpha1.SparkConnect) (warnings admission.Warnings, err error) {
+	if sc == nil {
 		return nil, nil
 	}
 
@@ -67,15 +67,9 @@ func (v *SparkConnectValidator) ValidateCreate(ctx context.Context, obj runtime.
 	return nil, nil
 }
 
-// ValidateUpdate implements admission.CustomValidator.
-func (v *SparkConnectValidator) ValidateUpdate(ctx context.Context, oldObj runtime.Object, newObj runtime.Object) (warnings admission.Warnings, err error) {
-	oldSC, ok := oldObj.(*v1alpha1.SparkConnect)
-	if !ok {
-		return nil, nil
-	}
-
-	newSC, ok := newObj.(*v1alpha1.SparkConnect)
-	if !ok {
+// ValidateUpdate implements admission.Validator.
+func (v *SparkConnectValidator) ValidateUpdate(ctx context.Context, oldSC *v1alpha1.SparkConnect, newSC *v1alpha1.SparkConnect) (warnings admission.Warnings, err error) {
+	if oldSC == nil || newSC == nil {
 		return nil, nil
 	}
 
@@ -99,10 +93,9 @@ func (v *SparkConnectValidator) ValidateUpdate(ctx context.Context, oldObj runti
 	return nil, nil
 }
 
-// ValidateDelete implements admission.CustomValidator.
-func (v *SparkConnectValidator) ValidateDelete(ctx context.Context, obj runtime.Object) (warnings admission.Warnings, err error) {
-	sc, ok := obj.(*v1alpha1.SparkConnect)
-	if !ok {
+// ValidateDelete implements admission.Validator.
+func (v *SparkConnectValidator) ValidateDelete(ctx context.Context, sc *v1alpha1.SparkConnect) (warnings admission.Warnings, err error) {
+	if sc == nil {
 		return nil, nil
 	}
 
@@ -161,6 +154,10 @@ func (v *SparkConnectValidator) validateSpec(sc *v1alpha1.SparkConnect) error {
 		return err
 	}
 
+	if err := validateSparkConf(sc.Spec.SparkConf, sc.Namespace); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -191,32 +188,27 @@ func (v *SparkConnectValidator) validateImage(sc *v1alpha1.SparkConnect) error {
 		return nil
 	}
 
-	// Otherwise, require that both server and executor pod templates provide container images.
-	serverImageFound := false
-	if sc.Spec.Server.Template != nil {
-		for _, container := range sc.Spec.Server.Template.Spec.Containers {
-			if container.Image != "" {
-				serverImageFound = true
-				break
-			}
-		}
-	}
-
-	executorImageFound := false
-	if sc.Spec.Executor.Template != nil {
-		for _, container := range sc.Spec.Executor.Template.Spec.Containers {
-			if container.Image != "" {
-				executorImageFound = true
-				break
-			}
-		}
-	}
+	// Otherwise, require that the server and executor containers selected from the pod templates provide images.
+	serverImageFound := podTemplateContainerImage(sc.Spec.Server.Template, common.SparkDriverContainerName) != ""
+	executorImageFound := podTemplateContainerImage(sc.Spec.Executor.Template, common.Spark3DefaultExecutorContainerName) != ""
 
 	if serverImageFound && executorImageFound {
 		return nil
 	}
 
-	return fmt.Errorf("image must be specified in spec.image or both server and executor pod templates must provide container images")
+	return fmt.Errorf("image must be specified in spec.image or in the selected server and executor template containers")
+}
+
+func podTemplateContainerImage(template *corev1.PodTemplateSpec, containerName string) string {
+	if template == nil || len(template.Spec.Containers) == 0 {
+		return ""
+	}
+
+	container := util.GetContainerByNameOrFirst(
+		template.Spec.Containers,
+		containerName,
+	)
+	return container.Image
 }
 
 // validateDynamicAllocation validates DynamicAllocation configuration.

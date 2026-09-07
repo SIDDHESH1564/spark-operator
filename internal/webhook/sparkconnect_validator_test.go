@@ -26,6 +26,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"github.com/kubeflow/spark-operator/v2/api/v1alpha1"
+	"github.com/kubeflow/spark-operator/v2/pkg/common"
 )
 
 func TestSparkConnectValidatorValidateCreate_Success(t *testing.T) {
@@ -120,6 +121,45 @@ func TestSparkConnectValidatorValidateCreate_ImageOnlyInServerTemplate(t *testin
 
 	if _, err := validator.ValidateCreate(context.Background(), sc); err == nil || !strings.Contains(err.Error(), "image must be specified") {
 		t.Fatalf("expected image validation error when only server template has image, got %v", err)
+	}
+}
+
+func TestSparkConnectValidatorValidateCreate_ImageOnlyInUnselectedContainer(t *testing.T) {
+	tests := []struct {
+		name     string
+		server   []corev1.Container
+		executor []corev1.Container
+	}{
+		{
+			name: "server sidecar",
+			server: []corev1.Container{
+				{Name: "sidecar", Image: "busybox:1.36"},
+				{Name: common.SparkDriverContainerName},
+			},
+			executor: []corev1.Container{{Name: "executor", Image: "spark:3.5.0"}},
+		},
+		{
+			name:   "executor sidecar",
+			server: []corev1.Container{{Name: "server", Image: "spark:3.5.0"}},
+			executor: []corev1.Container{
+				{Name: "sidecar", Image: "busybox:1.36"},
+				{Name: common.Spark3DefaultExecutorContainerName},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			validator := newTestSparkConnectValidator(t)
+			sc := newSparkConnect()
+			sc.Spec.Image = nil
+			sc.Spec.Server.Template = &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: test.server}}
+			sc.Spec.Executor.Template = &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: test.executor}}
+
+			if _, err := validator.ValidateCreate(context.Background(), sc); err == nil || !strings.Contains(err.Error(), "image must be specified") {
+				t.Fatalf("expected image validation error, got %v", err)
+			}
+		})
 	}
 }
 
@@ -359,6 +399,33 @@ func TestValidateMemoryString(t *testing.T) {
 				t.Errorf("validateMemoryString(%q) = error %v, wantError %v, got error: %v", tt.memory, hasError, tt.wantError, err)
 			}
 		})
+	}
+}
+
+func TestSparkConnectValidatorSparkConf_SecurityVectorsRejected(t *testing.T) {
+	validator := newTestSparkConnectValidator(t)
+
+	for _, tt := range sparkConfSecurityVectors {
+		t.Run(tt.name, func(t *testing.T) {
+			sc := newSparkConnect()
+			sc.Spec.SparkConf = tt.sparkConf
+
+			if _, err := validator.ValidateCreate(context.Background(), sc); err == nil {
+				t.Fatalf("expected sparkConf to be rejected, but it was allowed")
+			}
+		})
+	}
+}
+
+func TestSparkConnectValidatorSparkConf_UpdateRejected(t *testing.T) {
+	validator := newTestSparkConnectValidator(t)
+
+	oldSC := newSparkConnect()
+	newSC := newSparkConnect()
+	newSC.Spec.SparkConf = map[string]string{common.SparkMaster: "k8s://https://attacker-cluster:443"}
+
+	if _, err := validator.ValidateUpdate(context.Background(), oldSC, newSC); err == nil {
+		t.Fatalf("expected sparkConf to be rejected on update, but it was allowed")
 	}
 }
 

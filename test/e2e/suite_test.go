@@ -37,9 +37,12 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -116,7 +119,7 @@ var _ = BeforeSuite(func() {
 		// Note that you must have the required binaries setup under the bin directory to perform
 		// the tests directly. When we run make test it will be setup and used automatically.
 		BinaryAssetsDirectory: filepath.Join("..", "..", "bin", "k8s",
-			fmt.Sprintf("1.33.0-%s-%s", runtime.GOOS, runtime.GOARCH)),
+			fmt.Sprintf("1.35.0-%s-%s", runtime.GOOS, runtime.GOARCH)),
 		UseExistingCluster: ptr.To(true),
 	}
 
@@ -126,6 +129,7 @@ var _ = BeforeSuite(func() {
 
 	Expect(v1alpha1.AddToScheme(scheme.Scheme)).NotTo(HaveOccurred())
 	Expect(v1beta2.AddToScheme(scheme.Scheme)).NotTo(HaveOccurred())
+	Expect(policyv1.AddToScheme(scheme.Scheme)).NotTo(HaveOccurred())
 	// +kubebuilder:scaffold:scheme
 
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
@@ -218,8 +222,11 @@ func uninstallViaHelm() {
 
 func installViaKustomize() {
 	repoRoot := filepath.Join("..", "..")
-	kustomizeDir := filepath.Join(repoRoot, "config", "default")
-	kustomizationPath := filepath.Join(kustomizeDir, "kustomization.yaml")
+	// Deploy the driver-pdb overlay so e2e exercises the --enable-driver-pdb
+	// feature, matching the helm ci-values.yaml (driverPodDisruptionBudget.enable=true).
+	// The overlay inherits config/default, including the image tag we rewrite below.
+	kustomizeDir := filepath.Join(repoRoot, "config", "overlays", "driver-pdb")
+	kustomizationPath := filepath.Join(repoRoot, "config", "default", "kustomization.yaml")
 
 	imageTag := os.Getenv("IMAGE_TAG")
 	if imageTag != "" {
@@ -277,7 +284,7 @@ func uninstallViaKustomize() {
 	rbacDelCmd.Stderr = GinkgoWriter
 	_ = rbacDelCmd.Run()
 
-	kustomizeDir := filepath.Join(repoRoot, "config", "default")
+	kustomizeDir := filepath.Join(repoRoot, "config", "overlays", "driver-pdb")
 	By("Uninstalling the Spark operator via Kustomize")
 	deleteCmd := exec.Command("kubectl", "delete", "-k", kustomizeDir, "--ignore-not-found", "--timeout=120s")
 	deleteCmd.Stdout = GinkgoWriter
@@ -306,12 +313,13 @@ func waitForMutatingWebhookReady(ctx context.Context, key types.NamespacedName) 
 			if svcRef == nil {
 				return false, fmt.Errorf("webhook service is nil")
 			}
-			endpoints := corev1.Endpoints{}
-			endpointsKey := types.NamespacedName{Namespace: svcRef.Namespace, Name: svcRef.Name}
-			if err := k8sClient.Get(ctx, endpointsKey, &endpoints); err != nil {
+			endpointSliceList := discoveryv1.EndpointSliceList{}
+			if err := k8sClient.List(
+				ctx, &endpointSliceList, client.InNamespace(svcRef.Namespace), client.MatchingLabels{discoveryv1.LabelServiceName: svcRef.Name},
+			); err != nil {
 				return false, err
 			}
-			if len(endpoints.Subsets) == 0 {
+			if len(endpointSliceList.Items) == 0 {
 				return false, nil
 			}
 		}
@@ -342,12 +350,13 @@ func waitForValidatingWebhookReady(ctx context.Context, key types.NamespacedName
 			if svcRef == nil {
 				return false, fmt.Errorf("webhook service is nil")
 			}
-			endpoints := corev1.Endpoints{}
-			endpointsKey := types.NamespacedName{Namespace: svcRef.Namespace, Name: svcRef.Name}
-			if err := k8sClient.Get(ctx, endpointsKey, &endpoints); err != nil {
+			endpointSliceList := discoveryv1.EndpointSliceList{}
+			if err := k8sClient.List(
+				ctx, &endpointSliceList, client.InNamespace(svcRef.Namespace), client.MatchingLabels{discoveryv1.LabelServiceName: svcRef.Name},
+			); err != nil {
 				return false, err
 			}
-			if len(endpoints.Subsets) == 0 {
+			if len(endpointSliceList.Items) == 0 {
 				return false, nil
 			}
 		}
@@ -398,4 +407,31 @@ func collectSparkApplicationsUntilTermination(ctx context.Context, key types.Nam
 		return false, nil
 	})
 	return apps, err
+}
+
+// loadSparkApplication parses the SparkApplication example at path and gives
+// the caller a fresh copy. We rename it per-test so two tests can run in the
+// same namespace without colliding.
+func loadSparkApplication(path, name string) *v1beta2.SparkApplication {
+	app := &v1beta2.SparkApplication{}
+	file, err := os.Open(path)
+	Expect(err).NotTo(HaveOccurred())
+	defer func() {
+		_ = file.Close()
+	}()
+	Expect(yaml.NewYAMLOrJSONDecoder(file, 4096).Decode(app)).NotTo(HaveOccurred())
+	app.Name = name
+	app.ResourceVersion = ""
+	app.UID = ""
+	return app
+}
+
+// loadSparkPi loads the canonical Scala spark-pi example.
+func loadSparkPi(name string) *v1beta2.SparkApplication {
+	return loadSparkApplication(filepath.Join("..", "..", "examples", "spark-pi.yaml"), name)
+}
+
+// loadSparkPiPython loads the Python spark-pi example.
+func loadSparkPiPython(name string) *v1beta2.SparkApplication {
+	return loadSparkApplication(filepath.Join("..", "..", "examples", "spark-pi-python.yaml"), name)
 }
